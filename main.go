@@ -23,7 +23,8 @@ const usage = `keepon - keep tmux sessions alive across reboots
 Usage:
   keepon add [path]        Register a project (default: current directory)
                              --cmd "..."  command to run in the session
-                                          (default: claude --continue || claude)
+                                          (default: resume the project's pinned
+                                          claude session, named "claude <name>")
   keepon remove <name>     Unregister a project (does not kill its session)
   keepon list              Show projects and whether their session is running
   keepon up [name...]      Start sessions that aren't running (default: all)
@@ -78,7 +79,7 @@ func main() {
 
 func cmdAdd(args []string) error {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	cmd := fs.String("cmd", "", "command to run in the session (default: claude --continue || claude)")
+	cmd := fs.String("cmd", "", "command to run in the session (default: resume the project's pinned claude session)")
 	fs.Parse(args)
 
 	dir := "."
@@ -97,6 +98,9 @@ func cmdAdd(args []string) error {
 		return err
 	}
 	fmt.Printf("added %s (%s)\n", p.Name, p.Path)
+	if p.Cmd == "" {
+		fmt.Printf("  claude session: %q (%s)\n", p.ClaudeSessionName(), p.SessionID)
+	}
 	fmt.Printf("  runs: %s\n", p.RunCmd())
 	return nil
 }
@@ -133,7 +137,13 @@ func cmdList() error {
 		if tmux.HasSession(p.Name) {
 			state = "🟢 running"
 		}
-		fmt.Printf("%s  %-24s %s\n", state, p.Name, p.Path)
+		session := p.SessionID
+		if p.Cmd != "" {
+			session = "custom cmd"
+		} else if session == "" {
+			session = "unpinned (run: keepon up)"
+		}
+		fmt.Printf("%s  %-24s %-40s %s\n", state, p.Name, p.Path, session)
 	}
 	return nil
 }
@@ -162,6 +172,15 @@ func cmdUp(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if changed, err := cfg.EnsureSessionIDs(); err != nil {
+		return err
+	} else if changed {
+		if err := cfg.Save(); err != nil {
+			// Not fatal at boot: sessions still start, the unsaved IDs just
+			// regenerate on the next run.
+			fmt.Fprintf(os.Stderr, "keepon: could not save pinned session ids: %v\n", err)
+		}
 	}
 	projects, err := selectProjects(cfg, fs.Args())
 	if err != nil {

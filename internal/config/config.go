@@ -2,6 +2,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,17 +17,49 @@ const DefaultCmd = "claude --continue || claude"
 const DefaultNetworkCheckHost = "api.anthropic.com"
 
 type Project struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Cmd  string `json:"cmd,omitempty"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	Cmd       string `json:"cmd,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
-// RunCmd returns the command to run in the project's session.
+// ClaudeSessionName is the human-readable session name shown in the Claude app.
+func (p Project) ClaudeSessionName() string {
+	return "claude " + p.Name
+}
+
+// RunCmd returns the command to run in the project's session. An explicit Cmd
+// wins; otherwise a pinned SessionID resumes the same Claude session forever
+// (--resume looks the session up relative to the pane's cwd, which keepon
+// sets to the project path), creating it with that ID on first boot.
 func (p Project) RunCmd() string {
 	if p.Cmd != "" {
 		return p.Cmd
 	}
+	if p.SessionID != "" {
+		return fmt.Sprintf(
+			"claude --resume %s --remote-control || claude --session-id %s --name %s --remote-control",
+			p.SessionID, p.SessionID, shellQuote(p.ClaudeSessionName()))
+	}
 	return DefaultCmd
+}
+
+// NewSessionID returns a random RFC 4122 version-4 UUID for pinning a
+// project's Claude session.
+func NewSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// shellQuote single-quotes s for a POSIX shell; the run command is typed into
+// an interactive shell via tmux send-keys.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 type Config struct {
@@ -110,8 +143,30 @@ func (c *Config) Add(dir, cmd string) (*Project, error) {
 	if existing := c.Find(name); existing != nil {
 		return nil, fmt.Errorf("project %q already exists (%s)", name, existing.Path)
 	}
-	c.Projects = append(c.Projects, Project{Name: name, Path: abs, Cmd: cmd})
+	id, err := NewSessionID()
+	if err != nil {
+		return nil, err
+	}
+	c.Projects = append(c.Projects, Project{Name: name, Path: abs, Cmd: cmd, SessionID: id})
 	return &c.Projects[len(c.Projects)-1], nil
+}
+
+// EnsureSessionIDs backfills pinned session IDs for projects created before
+// pinned sessions existed. It reports whether the config changed.
+func (c *Config) EnsureSessionIDs() (bool, error) {
+	changed := false
+	for i := range c.Projects {
+		if c.Projects[i].SessionID != "" {
+			continue
+		}
+		id, err := NewSessionID()
+		if err != nil {
+			return changed, err
+		}
+		c.Projects[i].SessionID = id
+		changed = true
+	}
+	return changed, nil
 }
 
 // Remove deletes the named project. It reports whether it was present.

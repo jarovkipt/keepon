@@ -1,10 +1,14 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
+
+var uuidV4Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func TestSessionName(t *testing.T) {
 	cases := map[string]string{
@@ -30,6 +34,106 @@ func TestRunCmdDefault(t *testing.T) {
 	p.Cmd = "htop"
 	if got := p.RunCmd(); got != "htop" {
 		t.Errorf("RunCmd() = %q, want %q", got, "htop")
+	}
+}
+
+func TestRunCmdPinned(t *testing.T) {
+	const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	p := Project{Name: "test_project", Path: "/x", SessionID: id}
+	want := fmt.Sprintf(
+		"claude --resume %s --remote-control || claude --session-id %s --name 'claude test_project' --remote-control",
+		id, id)
+	if got := p.RunCmd(); got != want {
+		t.Errorf("RunCmd() = %q, want %q", got, want)
+	}
+
+	// An explicit Cmd override wins over the pinned session.
+	p.Cmd = "htop"
+	if got := p.RunCmd(); got != "htop" {
+		t.Errorf("RunCmd() with Cmd override = %q, want %q", got, "htop")
+	}
+}
+
+func TestNewSessionID(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		id, err := NewSessionID()
+		if err != nil {
+			t.Fatalf("NewSessionID: %v", err)
+		}
+		if !uuidV4Re.MatchString(id) {
+			t.Fatalf("NewSessionID() = %q, not a v4 UUID", id)
+		}
+		if seen[id] {
+			t.Fatalf("NewSessionID() repeated %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	cases := map[string]string{
+		"claude bonk":      "'claude bonk'",
+		"plain":            "'plain'",
+		"it's":             `'it'\''s'`,
+		"claude $HOME `x`": "'claude $HOME `x`'",
+	}
+	for in, want := range cases {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEnsureSessionIDs(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// Simulate a config written before session pinning existed.
+	path, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"network_check_host":"api.anthropic.com","projects":[{"name":"old","path":"/x"},{"name":"pinned","path":"/y","session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}]}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load old-format config: %v", err)
+	}
+	if cfg.Projects[0].SessionID != "" {
+		t.Fatalf("old project unexpectedly has SessionID %q", cfg.Projects[0].SessionID)
+	}
+
+	changed, err := cfg.EnsureSessionIDs()
+	if err != nil {
+		t.Fatalf("EnsureSessionIDs: %v", err)
+	}
+	if !changed {
+		t.Error("EnsureSessionIDs() changed = false, want true")
+	}
+	if !uuidV4Re.MatchString(cfg.Projects[0].SessionID) {
+		t.Errorf("backfilled SessionID = %q, not a v4 UUID", cfg.Projects[0].SessionID)
+	}
+	if cfg.Projects[1].SessionID != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
+		t.Errorf("existing SessionID was modified: %q", cfg.Projects[1].SessionID)
+	}
+
+	// Idempotent: a second call changes nothing.
+	first := cfg.Projects[0].SessionID
+	changed, err = cfg.EnsureSessionIDs()
+	if err != nil {
+		t.Fatalf("EnsureSessionIDs (2nd): %v", err)
+	}
+	if changed {
+		t.Error("second EnsureSessionIDs() changed = true, want false")
+	}
+	if cfg.Projects[0].SessionID != first {
+		t.Errorf("SessionID changed on second call: %q -> %q", first, cfg.Projects[0].SessionID)
 	}
 }
 
@@ -59,6 +163,9 @@ func TestConfigRoundTrip(t *testing.T) {
 	if p.Name != "my_app" {
 		t.Errorf("added project name = %q, want my_app", p.Name)
 	}
+	if !uuidV4Re.MatchString(p.SessionID) {
+		t.Errorf("added project SessionID = %q, not a v4 UUID", p.SessionID)
+	}
 	if _, err := cfg.Add(proj, ""); err == nil {
 		t.Error("duplicate Add should fail")
 	}
@@ -72,6 +179,9 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if len(cfg2.Projects) != 1 || cfg2.Projects[0].Name != "my_app" || cfg2.Projects[0].Path != proj {
 		t.Fatalf("round-trip mismatch: %+v", cfg2.Projects)
+	}
+	if cfg2.Projects[0].SessionID != p.SessionID {
+		t.Errorf("SessionID did not survive round-trip: %q -> %q", p.SessionID, cfg2.Projects[0].SessionID)
 	}
 
 	if !cfg2.Remove("my_app") {
