@@ -79,10 +79,48 @@ func main() {
 	}
 }
 
+// permute reorders args so flags may follow positional arguments, the way GNU
+// getopt and most CLIs behave. Go's flag package stops parsing at the first
+// non-flag argument, which silently swallowed the --cmd in the documented
+// "keepon add <path> --cmd ..." form and registered the project without it.
+func permute(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		// A bare "-" is a conventional positional, not a flag.
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+			continue
+		}
+		flags = append(flags, arg)
+
+		name := strings.TrimLeft(arg, "-")
+		if strings.Contains(name, "=") {
+			continue // -name=value carries its own value
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			continue // unknown: let fs.Parse report it
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue // a bool flag must not swallow the next argument
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, positional...)
+}
+
 func cmdAdd(args []string) error {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	cmd := fs.String("cmd", "", "command to run in the session (default: resume the project's pinned claude session)")
-	fs.Parse(args)
+	fs.Parse(permute(fs, args))
 
 	dir := "."
 	if fs.NArg() > 0 {
@@ -176,7 +214,7 @@ func selectProjects(cfg *config.Config, names []string) ([]config.Project, error
 func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	waitNet := fs.Bool("wait-network", false, "wait for DNS resolution before starting sessions")
-	fs.Parse(args)
+	fs.Parse(permute(fs, args))
 
 	cfg, err := config.Load()
 	if err != nil {
