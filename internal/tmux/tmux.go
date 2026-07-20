@@ -4,6 +4,7 @@ package tmux
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -31,6 +32,33 @@ func NewSession(name, dir string) error {
 // rejected as a pane target.
 func SendKeys(name, command string) error {
 	return run("send-keys", "-t", "="+name+":", command, "Enter")
+}
+
+// output runs tmux and returns its stdout, trimmed.
+func output(args ...string) (string, error) {
+	out, err := exec.Command("tmux", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("tmux %s: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
+// PanePID returns the PID of the shell tmux started in the session's active pane.
+func PanePID(name string) (int, error) {
+	out, err := output("display-message", "-p", "-t", "="+name+":", "#{pane_pid}")
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, fmt.Errorf("unexpected pane pid %q: %w", out, err)
+	}
+	return pid, nil
+}
+
+// CapturePane returns the visible text of the session's active pane.
+func CapturePane(name string) (string, error) {
+	return output("capture-pane", "-p", "-t", "="+name+":")
 }
 
 // KillSession terminates the session.

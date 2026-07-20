@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/jarovkipt/keepon/internal/claudecfg"
 	"github.com/jarovkipt/keepon/internal/config"
 	"github.com/jarovkipt/keepon/internal/netwait"
 	"github.com/jarovkipt/keepon/internal/systemd"
@@ -98,6 +100,13 @@ func cmdAdd(args []string) error {
 		return err
 	}
 	fmt.Printf("added %s (%s)\n", p.Name, p.Path)
+	// The project is registered either way; failing to pre-accept trust only
+	// means claude will stop at the prompt on restore, so warn and carry on.
+	if added, err := claudecfg.EnsureTrusted([]string{p.Path}); err != nil {
+		fmt.Fprintf(os.Stderr, "keepon: could not mark %s as trusted: %v\n", p.Path, err)
+	} else if len(added) > 0 {
+		fmt.Printf("  trusted: %s\n", p.Path)
+	}
 	if p.Cmd == "" {
 		fmt.Printf("  claude session: %q (%s)\n", p.ClaudeSessionName(), p.SessionID)
 	}
@@ -190,6 +199,16 @@ func cmdUp(args []string) error {
 		fmt.Println("no projects yet — add one with: keepon add <path>")
 		return nil
 	}
+	// Pre-accept the folder-trust prompt for every project about to start:
+	// nobody is attached to these panes to answer it. One read/write covers the
+	// whole batch, and it is a no-op once the paths are already trusted.
+	paths := make([]string, 0, len(projects))
+	for _, p := range projects {
+		paths = append(paths, p.Path)
+	}
+	if _, err := claudecfg.EnsureTrusted(paths); err != nil {
+		fmt.Fprintf(os.Stderr, "keepon: could not mark projects as trusted: %v\n", err)
+	}
 	if *waitNet {
 		fmt.Printf("waiting for network (%s)...\n", cfg.NetworkCheckHost)
 		if err := netwait.Wait(cfg.NetworkCheckHost, 90*time.Second); err != nil {
@@ -217,12 +236,88 @@ func cmdUp(args []string) error {
 			failed++
 			continue
 		}
+		if !waitForStart(p.Name) {
+			fmt.Fprintf(os.Stderr, "fail  %s: command did not start within %s\n", p.Name, startTimeout)
+			failed++
+			continue
+		}
+		if blocker := paneBlocker(p.Name); blocker != "" {
+			// Started, but waiting on something only a human can answer.
+			fmt.Printf("warn  %s: %s\n", p.Name, blocker)
+			continue
+		}
 		fmt.Printf("up    %s (%s)\n", p.Name, p.RunCmd())
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d project(s) failed to start", failed)
 	}
 	return nil
+}
+
+// startTimeout is how long to wait for the session's command to replace the
+// shell in its pane before calling the start a failure.
+const startTimeout = 15 * time.Second
+
+// waitForStart reports whether the session's command is actually running. It
+// asks whether the pane's shell has spawned a child rather than scraping the
+// screen, so it does not depend on how any particular TUI renders itself, and
+// unlike matching #{pane_current_command} against a list of shell names it does
+// not misjudge commands that legitimately run inside a shell wrapper (a .sh
+// script, "npm run dev") as never having started.
+func waitForStart(name string) bool {
+	deadline := time.Now().Add(startTimeout)
+	for {
+		if pid, err := tmux.PanePID(name); err == nil && hasChild(pid) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// hasChild reports whether pid has at least one child process. keepon is
+// Linux-only (it installs a systemd user unit), so /proc is always available.
+func hasChild(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return false
+	}
+	return len(strings.Fields(string(data))) > 0
+}
+
+// blockerPatterns are lowercase markers of a pane stuck waiting for a human.
+// They must be specific enough not to match healthy chrome: a bare "/login"
+// would flag the routine "your login expires in N days · run /login to renew"
+// notice that Claude Code shows on a perfectly good session.
+var blockerPatterns = []string{
+	"do you trust",
+	"invalid api key",
+	"please run /login",
+	"login required",
+	"session expired",
+}
+
+// paneBlocker returns the first visible line suggesting the session is waiting
+// on input nobody is there to give, or "" if it looks healthy.
+func paneBlocker(name string) string {
+	// The pane command flips as soon as the process execs, which is before its
+	// TUI has painted anything. Give it a moment or we capture a blank screen.
+	time.Sleep(2 * time.Second)
+	text, err := tmux.CapturePane(name)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(text, "\n") {
+		lower := strings.ToLower(line)
+		for _, pat := range blockerPatterns {
+			if strings.Contains(lower, pat) {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+	return ""
 }
 
 func cmdDown(args []string) error {

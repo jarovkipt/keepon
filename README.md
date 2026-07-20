@@ -56,6 +56,14 @@ Each project gets a permanent Claude session, created once and resumed forever �
 - Projects added before this feature get a `session_id` backfilled (and saved) on the next `keepon up`.
 - If a pinned session ever gets corrupted, delete its `session_id` line from the config — a fresh one is generated on the next `keepon up`.
 
+## Folder trust
+
+Claude Code asks *"Do you trust the files in this folder?"* the first time it runs in a directory. A restored session is detached with nobody attached to answer, so claude would sit on that prompt forever and never reach the Claude app.
+
+`keepon add` and `keepon up` therefore mark each registered project as trusted in Claude Code's own state file (`~/.claude.json`, key `projects["<path>"].hasTrustDialogAccepted`) before launching anything. Only paths you registered are touched, every other key in the file is preserved, and the write is skipped entirely once they're all trusted.
+
+This pre-accepts the trust dialog only — it does **not** skip permission prompts for individual tools.
+
 ## Commands
 
 ```
@@ -74,7 +82,10 @@ keepon logs              What happened at the last restore
 ## How it works
 
 - **Config** lives at `~/.config/keepon/config.json` — a plain list of `{name, path, cmd, session_id}`. Edit it by hand if you like.
-- **`keepon up`** creates a detached tmux session per project (`tmux new-session -d -c <path>`) and types the command into it. Sessions that already exist are skipped, so it's safe to run anytime.
+- **`keepon up`** creates a detached tmux session per project (`tmux new-session -d -c <path>`) and types the command into it. Sessions that already exist are skipped, so it's safe to run anytime. It then waits up to 15 s for the command to actually start (checking whether the pane's shell spawned a child, which works for shell scripts and wrappers too) and reports what it sees:
+  - `up` — running, nothing alarming on screen
+  - `warn` — running but the pane looks stuck on a prompt (trust dialog, expired login); the message is the offending line
+  - `fail` — nothing is running in the pane; counts as an error and makes `keepon up` exit non-zero
 - **`keepon install`** writes a systemd *user* unit that runs `keepon up --wait-network` at boot, and enables [lingering](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html#enable-linger%20USER%E2%80%A6) (`loginctl enable-linger`) so your user services start without anyone logging in.
 - **`--wait-network`** polls DNS (default host: `api.anthropic.com`, configurable via `network_check_host`) for up to 90 s before starting sessions, because at boot the service can win the race against your network.
 
