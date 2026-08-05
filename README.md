@@ -38,7 +38,7 @@ keepon install                    # systemd user service + lingering, one comman
 keepon attach project1            # jump into a session
 ```
 
-That's it. On every boot, all sessions come back with the same pinned Claude conversation running inside.
+That's it. On every boot, each session comes back with the same pinned Claude conversation running inside — see [Choosing what starts at boot](#choosing-what-starts-at-boot) once you have more projects than memory.
 
 ## One pinned session per project
 
