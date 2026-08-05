@@ -65,3 +65,14 @@ func CapturePane(name string) (string, error) {
 func KillSession(name string) error {
 	return run("kill-session", "-t", "="+name)
 }
+
+// AttachArgs returns the tmux arguments that put the caller in the named
+// session. Inside an existing session tmux refuses to attach (it would nest a
+// client in its own terminal), so the equivalent move there is to switch the
+// current client instead.
+func AttachArgs(name string, insideTmux bool) []string {
+	if insideTmux {
+		return []string{"tmux", "switch-client", "-t", "=" + name}
+	}
+	return []string{"tmux", "attach-session", "-t", "=" + name}
+}

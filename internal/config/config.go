@@ -21,6 +21,28 @@ type Project struct {
 	Path      string `json:"path"`
 	Cmd       string `json:"cmd,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
+
+	// Autostart nil means yes. It is a pointer rather than a plain bool so a
+	// config written before this field existed keeps starting at boot instead of
+	// silently going quiet, and so the common case stays out of the file.
+	Autostart *bool `json:"autostart,omitempty"`
+}
+
+// AutostartEnabled reports whether `keepon up` with no names should start p.
+// Turning it off keeps the project registered — and its pinned session id
+// intact — so `keepon attach` can still resume the same conversation on demand.
+func (p Project) AutostartEnabled() bool {
+	return p.Autostart == nil || *p.Autostart
+}
+
+// SetAutostart records whether p should start at boot. It reports whether the
+// setting changed, so callers can summarize only what they actually touched.
+func (p *Project) SetAutostart(on bool) bool {
+	if p.AutostartEnabled() == on {
+		return false
+	}
+	p.Autostart = &on
+	return true
 }
 
 // ClaudeSessionName is the human-readable session name shown in the Claude app.

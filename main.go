@@ -8,30 +8,42 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jarovkipt/keepon/internal/claudecfg"
 	"github.com/jarovkipt/keepon/internal/config"
 	"github.com/jarovkipt/keepon/internal/netwait"
+	"github.com/jarovkipt/keepon/internal/proc"
 	"github.com/jarovkipt/keepon/internal/systemd"
 	"github.com/jarovkipt/keepon/internal/tmux"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 const usage = `keepon - keep tmux sessions alive across reboots
 
 Usage:
-  keepon add [path]        Register a project (default: current directory)
-                             --cmd "..."  command to run in the session
-                                          (default: resume the project's pinned
-                                          claude session, named "claude <name>")
-  keepon remove <name>     Unregister a project (does not kill its session)
-  keepon list              Show projects and whether their session is running
-  keepon up [name...]      Start sessions that aren't running (default: all)
+  keepon add [path]        Register a project and start it (default: current dir)
+                             --cmd "..."      command to run in the session
+                                              (default: resume the project's
+                                              pinned claude session, named
+                                              "claude <name>")
+                             --no-up          register without starting it
+                             --no-autostart   don't start it at boot
+  keepon remove <name...>  Unregister projects
+                             --kill  also kill their tmux sessions
+  keepon list              Show projects, their real state, and their RAM
+  keepon attach <name>     Enter a session, starting it first if needed
+  keepon autostart on|off <name...>
+                           Choose which projects start at boot
+  keepon up [name...]      Start sessions that aren't running
+                           (default: every project with autostart on)
                              --wait-network  wait for DNS before starting
   keepon down [name...]    Kill sessions (default: all)
+                             --idle  only sessions whose command already exited
   keepon install           Install + enable the systemd user service so
                            sessions restore automatically at boot
   keepon uninstall         Remove the systemd user service
@@ -53,6 +65,10 @@ func main() {
 		err = cmdRemove(os.Args[2:])
 	case "list", "ls":
 		err = cmdList()
+	case "attach", "a":
+		err = cmdAttach(os.Args[2:])
+	case "autostart":
+		err = cmdAutostart(os.Args[2:])
 	case "up":
 		err = cmdUp(os.Args[2:])
 	case "down":
@@ -120,6 +136,8 @@ func permute(fs *flag.FlagSet, args []string) []string {
 func cmdAdd(args []string) error {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	cmd := fs.String("cmd", "", "command to run in the session (default: resume the project's pinned claude session)")
+	noUp := fs.Bool("no-up", false, "register the project without starting its session")
+	noAutostart := fs.Bool("no-autostart", false, "do not start this project at boot")
 	fs.Parse(permute(fs, args))
 
 	dir := "."
@@ -133,6 +151,9 @@ func cmdAdd(args []string) error {
 	p, err := cfg.Add(dir, *cmd)
 	if err != nil {
 		return err
+	}
+	if *noAutostart {
+		p.SetAutostart(false)
 	}
 	if err := cfg.Save(); err != nil {
 		return err
@@ -148,26 +169,106 @@ func cmdAdd(args []string) error {
 	if p.Cmd == "" {
 		fmt.Printf("  claude session: %q (%s)\n", p.ClaudeSessionName(), p.SessionID)
 	}
-	fmt.Printf("  runs: %s\n", p.RunCmd())
+	if *noAutostart {
+		fmt.Printf("  autostart: off (start it with: keepon attach %s)\n", p.Name)
+	}
+	if *noUp {
+		fmt.Printf("  runs: %s\n", p.RunCmd())
+		return nil
+	}
+	// Registering a project and then having to run `up` by hand is a step nobody
+	// wants; adding one means you want it now.
+	if failed := restore([]config.Project{*p}); failed > 0 {
+		return fmt.Errorf("%s was added but its session failed to start", p.Name)
+	}
 	return nil
 }
 
 func cmdRemove(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: keepon remove <name>")
+	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	kill := fs.Bool("kill", false, "also kill each project's tmux session")
+	fs.Parse(permute(fs, args))
+
+	if fs.NArg() == 0 {
+		return fmt.Errorf("usage: keepon remove [--kill] <name...>")
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	if !cfg.Remove(args[0]) {
-		return fmt.Errorf("no project named %q (see: keepon list)", args[0])
+	// Resolve every name before changing anything, so a typo in the third name
+	// does not leave the first two half-removed.
+	for _, name := range fs.Args() {
+		if cfg.Find(name) == nil {
+			return fmt.Errorf("no project named %q (see: keepon list)", name)
+		}
 	}
-	if err := cfg.Save(); err != nil {
-		return err
+	for _, name := range fs.Args() {
+		if *kill && tmux.HasSession(name) {
+			if err := tmux.KillSession(name); err != nil {
+				return err
+			}
+		}
+		cfg.Remove(name)
+		if *kill {
+			fmt.Printf("removed %s (session killed)\n", name)
+		} else {
+			fmt.Printf("removed %s (its tmux session, if running, was left alone)\n", name)
+		}
 	}
-	fmt.Printf("removed %s (its tmux session, if running, was left alone)\n", args[0])
-	return nil
+	return cfg.Save()
+}
+
+// sessionState is how much of a project is actually up.
+type sessionState int
+
+const (
+	stateStopped sessionState = iota // no tmux session at all
+	stateIdle                        // a session, but its pane is a bare shell
+	stateRunning                     // the run command is alive in the pane
+)
+
+func (s sessionState) icon() string {
+	switch s {
+	case stateRunning:
+		return "🟢"
+	case stateIdle:
+		return "🟡"
+	default:
+		return "⚫"
+	}
+}
+
+func (s sessionState) String() string {
+	switch s {
+	case stateRunning:
+		return "running"
+	case stateIdle:
+		return "idle"
+	default:
+		return "stopped"
+	}
+}
+
+// sessionInfo is one project's live state plus what it costs in memory.
+type sessionInfo struct {
+	state sessionState
+	rss   int64 // resident bytes of everything running in the pane
+}
+
+// inspect reports a session's real state. `tmux has-session` alone cannot tell a
+// working session from one whose command exited — or was killed to free RAM —
+// and left the pane sitting at a shell prompt, which is the difference between
+// "leave it alone" and "start it again".
+func inspect(name string) sessionInfo {
+	pid, err := tmux.PanePID(name)
+	if err != nil {
+		return sessionInfo{state: stateStopped}
+	}
+	if !proc.HasChild(pid) {
+		return sessionInfo{state: stateIdle}
+	}
+	return sessionInfo{state: stateRunning, rss: proc.TreeRSS(pid)}
 }
 
 func cmdList() error {
@@ -179,20 +280,43 @@ func cmdList() error {
 		fmt.Println("no projects yet — add one with: keepon add <path>")
 		return nil
 	}
+	var running, autostart int
+	var totalRSS int64
 	for _, p := range cfg.Projects {
-		state := "⚫ stopped"
-		if tmux.HasSession(p.Name) {
-			state = "🟢 running"
+		info := inspect(p.Name)
+		if info.state == stateRunning {
+			running++
 		}
-		session := p.SessionID
-		if p.Cmd != "" {
-			session = "custom cmd"
-		} else if session == "" {
-			session = "unpinned (run: keepon up)"
+		totalRSS += info.rss
+
+		ram := "-"
+		if info.rss > 0 {
+			ram = proc.FormatBytes(info.rss)
 		}
-		fmt.Printf("%s  %-24s %-40s %s\n", state, p.Name, p.Path, session)
+		auto := ""
+		if p.AutostartEnabled() {
+			autostart++
+		} else {
+			auto = "  (autostart off)"
+		}
+		fmt.Printf("%s %-8s %8s  %-28s %s%s\n",
+			info.state.icon(), info.state, ram, p.Name, shortenHome(p.Path), auto)
 	}
+	fmt.Printf("\nrunning %d/%d · autostart %d · RAM %s\n",
+		running, len(cfg.Projects), autostart, proc.FormatBytes(totalRSS))
 	return nil
+}
+
+// shortenHome trims $HOME to "~" so the path column stays readable.
+func shortenHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if rel, err := filepath.Rel(home, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.Join("~", rel)
+	}
+	return path
 }
 
 // selectProjects returns the projects matching names, or all when names is empty.
@@ -209,6 +333,71 @@ func selectProjects(cfg *config.Config, names []string) ([]config.Project, error
 		out = append(out, *p)
 	}
 	return out, nil
+}
+
+func cmdAttach(args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if len(args) != 1 {
+		if err := cmdList(); err != nil {
+			return err
+		}
+		return fmt.Errorf("usage: keepon attach <name>")
+	}
+	name := args[0]
+	p := cfg.Find(name)
+	if p == nil {
+		return fmt.Errorf("no project named %q (see: keepon list)", name)
+	}
+	// Starting on demand is the point: projects with autostart off spend most of
+	// their life stopped, and attaching is how you wake one without also paying
+	// for the other eighteen.
+	if inspect(p.Name).state != stateRunning {
+		if failed := restore([]config.Project{*p}); failed > 0 {
+			return fmt.Errorf("%s failed to start", p.Name)
+		}
+	}
+	tmuxBin, err := exec.LookPath("tmux")
+	if err != nil {
+		return err
+	}
+	// Hand the terminal over rather than sitting in the middle of it: tmux owns
+	// the tty from here, and there is nothing left for keepon to do.
+	argv := tmux.AttachArgs(p.Name, os.Getenv("TMUX") != "")
+	return syscall.Exec(tmuxBin, argv, os.Environ())
+}
+
+func cmdAutostart(args []string) error {
+	if len(args) < 2 || (args[0] != "on" && args[0] != "off") {
+		return fmt.Errorf("usage: keepon autostart on|off <name...>")
+	}
+	on := args[0] == "on"
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	for _, name := range args[1:] {
+		if cfg.Find(name) == nil {
+			return fmt.Errorf("no project named %q (see: keepon list)", name)
+		}
+	}
+	changed := 0
+	for _, name := range args[1:] {
+		if cfg.Find(name).SetAutostart(on) {
+			changed++
+		}
+	}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("autostart %s for %d project(s) (%d already were)\n",
+		args[0], changed, len(args)-1-changed)
+	if !on {
+		fmt.Println("their sessions are untouched; wake one later with: keepon attach <name>")
+	}
+	return nil
 }
 
 func cmdUp(args []string) error {
@@ -237,6 +426,25 @@ func cmdUp(args []string) error {
 		fmt.Println("no projects yet — add one with: keepon add <path>")
 		return nil
 	}
+	// Naming a project means you want that one up whatever its autostart says;
+	// the setting only decides what a bare `keepon up` — which is what the boot
+	// service runs — brings back.
+	if fs.NArg() == 0 {
+		var wanted []config.Project
+		for _, p := range projects {
+			if p.AutostartEnabled() {
+				wanted = append(wanted, p)
+			}
+		}
+		if skipped := len(projects) - len(wanted); skipped > 0 {
+			fmt.Printf("autostart off for %d project(s), leaving them stopped\n", skipped)
+		}
+		projects = wanted
+	}
+	if len(projects) == 0 {
+		fmt.Println("nothing to start — every project has autostart off")
+		return nil
+	}
 	// Pre-accept the folder-trust prompt for every project about to start:
 	// nobody is attached to these panes to answer it. One read/write covers the
 	// whole batch, and it is a no-op once the paths are already trusted.
@@ -253,43 +461,58 @@ func cmdUp(args []string) error {
 			fmt.Fprintln(os.Stderr, "keepon:", err, "- starting sessions anyway")
 		}
 	}
-	var failed int
-	for _, p := range projects {
-		if tmux.HasSession(p.Name) {
-			fmt.Printf("skip  %s (already running)\n", p.Name)
-			continue
-		}
-		if _, err := os.Stat(p.Path); err != nil {
-			fmt.Fprintf(os.Stderr, "fail  %s: %v\n", p.Name, err)
-			failed++
-			continue
-		}
-		if err := tmux.NewSession(p.Name, p.Path); err != nil {
-			fmt.Fprintf(os.Stderr, "fail  %s: %v\n", p.Name, err)
-			failed++
-			continue
-		}
-		if err := tmux.SendKeys(p.Name, p.RunCmd()); err != nil {
-			fmt.Fprintf(os.Stderr, "fail  %s: %v\n", p.Name, err)
-			failed++
-			continue
-		}
-		if !waitForStart(p.Name) {
-			fmt.Fprintf(os.Stderr, "fail  %s: command did not start within %s\n", p.Name, startTimeout)
-			failed++
-			continue
-		}
-		if blocker := paneBlocker(p.Name); blocker != "" {
-			// Started, but waiting on something only a human can answer.
-			fmt.Printf("warn  %s: %s\n", p.Name, blocker)
-			continue
-		}
-		fmt.Printf("up    %s (%s)\n", p.Name, p.RunCmd())
-	}
-	if failed > 0 {
+	if failed := restore(projects); failed > 0 {
 		return fmt.Errorf("%d project(s) failed to start", failed)
 	}
 	return nil
+}
+
+// restore starts every project that is not already running and reports how many
+// failed, printing one line per project in the vocabulary `keepon up` has always
+// used: skip / up / warn / fail.
+func restore(projects []config.Project) (failed int) {
+	for _, p := range projects {
+		if inspect(p.Name).state == stateRunning {
+			fmt.Printf("skip  %s (already running)\n", p.Name)
+			continue
+		}
+		blocker, err := start(p)
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "fail  %s: %v\n", p.Name, err)
+			failed++
+		case blocker != "":
+			// Started, but waiting on something only a human can answer.
+			fmt.Printf("warn  %s: %s\n", p.Name, blocker)
+		default:
+			fmt.Printf("up    %s (%s)\n", p.Name, p.RunCmd())
+		}
+	}
+	return failed
+}
+
+// start brings one project's session to running. A stopped project gets a fresh
+// tmux session; an idle one gets the run command typed into the pane it already
+// has, which is what a session whose command was killed by hand needs — without
+// it the empty session would sit there forever, since it still answers
+// `tmux has-session`. It returns the pane's blocker text when the command
+// started but is waiting on an answer only a human can give.
+func start(p config.Project) (blocker string, err error) {
+	if _, err := os.Stat(p.Path); err != nil {
+		return "", err
+	}
+	if !tmux.HasSession(p.Name) {
+		if err := tmux.NewSession(p.Name, p.Path); err != nil {
+			return "", err
+		}
+	}
+	if err := tmux.SendKeys(p.Name, p.RunCmd()); err != nil {
+		return "", err
+	}
+	if !waitForStart(p.Name) {
+		return "", fmt.Errorf("command did not start within %s", startTimeout)
+	}
+	return paneBlocker(p.Name), nil
 }
 
 // startTimeout is how long to wait for the session's command to replace the
@@ -298,14 +521,11 @@ const startTimeout = 15 * time.Second
 
 // waitForStart reports whether the session's command is actually running. It
 // asks whether the pane's shell has spawned a child rather than scraping the
-// screen, so it does not depend on how any particular TUI renders itself, and
-// unlike matching #{pane_current_command} against a list of shell names it does
-// not misjudge commands that legitimately run inside a shell wrapper (a .sh
-// script, "npm run dev") as never having started.
+// screen, so it does not depend on how any particular TUI renders itself.
 func waitForStart(name string) bool {
 	deadline := time.Now().Add(startTimeout)
 	for {
-		if pid, err := tmux.PanePID(name); err == nil && hasChild(pid) {
+		if pid, err := tmux.PanePID(name); err == nil && proc.HasChild(pid) {
 			return true
 		}
 		if time.Now().After(deadline) {
@@ -313,16 +533,6 @@ func waitForStart(name string) bool {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-}
-
-// hasChild reports whether pid has at least one child process. keepon is
-// Linux-only (it installs a systemd user unit), so /proc is always available.
-func hasChild(pid int) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
-	if err != nil {
-		return false
-	}
-	return len(strings.Fields(string(data))) > 0
 }
 
 // blockerPatterns are lowercase markers of a pane stuck waiting for a human.
@@ -359,19 +569,30 @@ func paneBlocker(name string) string {
 }
 
 func cmdDown(args []string) error {
+	fs := flag.NewFlagSet("down", flag.ExitOnError)
+	idleOnly := fs.Bool("idle", false, "only kill sessions whose command already exited")
+	fs.Parse(permute(fs, args))
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	projects, err := selectProjects(cfg, args)
+	projects, err := selectProjects(cfg, fs.Args())
 	if err != nil {
 		return err
 	}
 	for _, p := range projects {
-		if !tmux.HasSession(p.Name) {
+		state := inspect(p.Name).state
+		if state == stateStopped {
 			fmt.Printf("skip  %s (not running)\n", p.Name)
 			continue
 		}
+		if *idleOnly && state != stateIdle {
+			fmt.Printf("skip  %s (still running)\n", p.Name)
+			continue
+		}
+		// Killing the session kills everything in its panes, which is the point:
+		// an idle session costs nothing but a running claude costs ~400 MB.
 		if err := tmux.KillSession(p.Name); err != nil {
 			return err
 		}
@@ -417,13 +638,24 @@ func cmdStatus() error {
 	onOff := map[bool]string{true: "yes", false: "no"}
 	fmt.Printf("service enabled (starts at boot): %s\n", onOff[systemd.Enabled()])
 	fmt.Printf("lingering (starts without login): %s\n", onOff[systemd.LingerEnabled()])
-	running := 0
+	running, idle, autostart := 0, 0, 0
+	var totalRSS int64
 	for _, p := range cfg.Projects {
-		if tmux.HasSession(p.Name) {
+		info := inspect(p.Name)
+		switch info.state {
+		case stateRunning:
 			running++
+		case stateIdle:
+			idle++
+		}
+		totalRSS += info.rss
+		if p.AutostartEnabled() {
+			autostart++
 		}
 	}
-	fmt.Printf("sessions running: %d/%d\n", running, len(cfg.Projects))
+	fmt.Printf("sessions running: %d/%d (%d idle)\n", running, len(cfg.Projects), idle)
+	fmt.Printf("start at boot: %d\n", autostart)
+	fmt.Printf("RAM in sessions: %s\n", proc.FormatBytes(totalRSS))
 	if !systemd.Enabled() || !systemd.LingerEnabled() {
 		fmt.Println("\nrun `keepon install` to make sessions survive reboots")
 	}

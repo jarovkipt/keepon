@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -189,6 +191,72 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if cfg2.Remove("nope") {
 		t.Error("Remove missing = true, want false")
+	}
+}
+
+// TestAutostartDefaultsOn is the compatibility case: every config on disk today
+// predates the field, and those projects must keep starting at boot.
+func TestAutostartDefaultsOn(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"projects":[{"name":"legacy","path":"/tmp","session_id":"abc"}]}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Projects[0].AutostartEnabled() {
+		t.Error("project from a pre-autostart config = off, want on")
+	}
+}
+
+func TestSetAutostartRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &Config{Projects: []Project{{Name: "a", Path: "/tmp"}}}
+
+	if cfg.Projects[0].SetAutostart(true) {
+		t.Error("SetAutostart(true) on a default project reported a change, want none")
+	}
+	if !cfg.Projects[0].SetAutostart(false) {
+		t.Error("SetAutostart(false) reported no change, want one")
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.Projects[0].AutostartEnabled() {
+		t.Error("autostart=false did not survive the round-trip")
+	}
+	if !cfg2.Projects[0].SetAutostart(true) {
+		t.Error("turning autostart back on reported no change")
+	}
+	if !cfg2.Projects[0].AutostartEnabled() {
+		t.Error("SetAutostart(true) did not re-enable")
+	}
+}
+
+// TestAutostartOmittedWhenOn keeps the common case out of the config file, so
+// hand-editing it stays readable.
+func TestAutostartOmittedWhenOn(t *testing.T) {
+	data, err := json.Marshal(Project{Name: "a", Path: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "autostart") {
+		t.Errorf("default project serialized as %s, want no autostart key", data)
 	}
 }
 
