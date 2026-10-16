@@ -501,6 +501,17 @@ func start(p config.Project) (blocker string, err error) {
 	if _, err := os.Stat(p.Path); err != nil {
 		return "", err
 	}
+	if p.Cmd == "" && p.SessionID != "" {
+		// A pinned session whose claude exited before its first message can
+		// neither be resumed nor created again until its stub is moved aside.
+		cleared, err := claudecfg.ClearEmptyTranscript(p.SessionID)
+		if err != nil {
+			return "", fmt.Errorf("checking session transcript: %w", err)
+		}
+		if cleared {
+			fmt.Printf("note  %s: moved aside an empty session transcript (no messages)\n", p.Name)
+		}
+	}
 	if !tmux.HasSession(p.Name) {
 		if err := tmux.NewSession(p.Name, p.Path); err != nil {
 			return "", err
@@ -512,7 +523,14 @@ func start(p config.Project) (blocker string, err error) {
 	if !waitForStart(p.Name) {
 		return "", fmt.Errorf("command did not start within %s", startTimeout)
 	}
-	return paneBlocker(p.Name), nil
+	blocker = paneBlocker(p.Name)
+	// paneBlocker has given the command a couple of seconds; one that already
+	// gave up (a resume that cannot find its session, say) left a bare shell
+	// behind, and that is a failure, not a session that is up.
+	if inspect(p.Name).state != stateRunning {
+		return "", fmt.Errorf("command exited right after starting (see: tmux attach -t %s)", p.Name)
+	}
+	return blocker, nil
 }
 
 // startTimeout is how long to wait for the session's command to replace the
